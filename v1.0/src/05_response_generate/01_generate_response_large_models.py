@@ -1,359 +1,1172 @@
+#!/usr/bin/env python3
+
 # =========================================================
-# 🔷 IMPORTS
+# IMPORTS
 # =========================================================
+
+import argparse
 import json
-import os
+import math
 import time
 from pathlib import Path
-import argparse
-import pandas as pd
+from typing import Any, Dict, Optional, Set, Tuple
+
 from openai import OpenAI
 
+
 # =========================================================
-# 🔷 MINDROUTER API CALL
+# JSON HELPERS
 # =========================================================
-def call_mindrouter_api(
-    prompt,
-    model="openai/gpt-oss-120b",
-    api_key="YOUR_API_KEY",
-    base_url="https://mindrouter.uidaho.edu/v1",
-    temperature=0,
-    top_p=1,
-    max_tokens=512
-):
-    client = OpenAI(api_key=api_key, base_url=base_url)
 
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are a helpful, safe, and honest assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens
-        )
-        
-        choice = response.choices[0]
+def clean_json_value(value: Any) -> Any:
+    """
+    Recursively convert NaN/Inf into None so that the
+    output is strict valid JSON.
+    """
 
-        content = choice.message.content
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
 
-        if content is None:
-            content = getattr(choice.message, "reasoning_content", None)
-        #print(content)
+    if isinstance(value, dict):
         return {
-            "response": content,
-            "error": None
+            k: clean_json_value(v)
+            for k, v in value.items()
         }
 
-    except Exception as e:
-        return {
-            "response": "ERROR",
-            "error": str(e)
-        }
+    if isinstance(value, list):
+        return [
+            clean_json_value(v)
+            for v in value
+        ]
+
+    return value
 
 
-def mind_router(params):
-    prompt = params.get("prompt")
+def append_to_jsonl(
+    file_path: Path,
+    records,
+) -> None:
+    """
+    Append records to output JSONL.
+    """
 
-    result = call_mindrouter_api(
-        prompt=prompt,
-        model=params.get("model", "openai/gpt-oss-120b"),
-        api_key=params.get("api_key", "YOUR_API_KEY"),
-        temperature=params.get("temperature", 0),
-        top_p=params.get("top_p", 1),
-        max_tokens=params.get("max_tokens", 512)
+    file_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    # call_mindrouter_api returns (None, error_str) on failure
-    if isinstance(result, tuple):
-        return {
-            "response":               "ERROR",
-            "error":                  result[1],
-            "prompt_length_tokens":   0,
-            "response_length_tokens": 0,
-            "total_tokens":           0,
-        }
+    with file_path.open(
+        "a",
+        encoding="utf-8",
+    ) as f:
 
-    return {
-        "response":               result.choices[0].message.content,
-        "error":                  None,
-        # ── Pull real token counts from API usage object ──────────
-        "prompt_length_tokens":   result.usage.prompt_tokens,
-        "response_length_tokens": result.usage.completion_tokens,
-        "total_tokens":           result.usage.total_tokens,
-    }
+        for record in records:
 
+            record = clean_json_value(
+                record
+            )
 
-# =========================================================
-# 🔷 LOAD FILTER + META
-# =========================================================
-def load_filter_data(filter_file):
-    df_filter = pd.read_csv(filter_file)
-
-    filter_map = {}
-    filter_meta = {}
-
-    for _, row in df_filter.iterrows():
-        rid = str(row["root_id"])
-        lang = str(row["language"])
-
-        if rid not in filter_map:
-            filter_map[rid] = set()
-        filter_map[rid].add(lang)
-
-        filter_meta[(rid, lang)] = {
-            "category": row.get("category"),
-            "tier": row.get("tier"),
-            "label": row.get("label"),
-            "f1": row.get("f1"),
-            "comet": row.get("comet"),
-            "combined_score": row.get("combined_score"),
-            "quality_bucket": row.get("quality_bucket"),
-        }
-
-    print(f"✅ Loaded filter metadata for {len(filter_map)} root_ids")
-    return filter_map, filter_meta
+            f.write(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                + "\n"
+            )
 
 
 # =========================================================
-# 🔷 FLATTEN WITH FILTER
+# INPUT LOADING
 # =========================================================
-def flatten_prompts_filtered(data, filter_map):
-    flat_data = []
 
-    for obj in data:
-        rid = obj["id"]
+def load_filtered_data(
+    input_file: Path,
+):
+    """
+    Load already-filtered multilingual AEGIS JSONL.
 
-        if rid not in filter_map:
-            continue
+    Expected important fields:
 
-        for lang, trans in obj.get("translation", {}).items():
-            if lang not in filter_map[rid]:
+        root_id
+        language
+        category
+        prompt_translated
+
+    Other quality metadata are copied into eval.
+    """
+
+    records = []
+
+    invalid_json = 0
+    missing_fields = 0
+    duplicate_triples = 0
+
+    seen_triples: Set[
+        Tuple[str, str, str]
+    ] = set()
+
+    required_fields = [
+        "root_id",
+        "language",
+        "category",
+        "prompt_translated",
+    ]
+
+
+    with input_file.open(
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        for line_num, line in enumerate(
+            f,
+            start=1,
+        ):
+
+            line = line.strip()
+
+            if not line:
                 continue
 
-            prompt = trans.get("prompt_translated_lang")
 
-            if prompt:
-                flat_data.append({
-                    "root_id": rid,
-                    "language": lang,
-                    "prompt": prompt
-                })
+            # ---------------------------------------------
+            # Parse JSON
+            # ---------------------------------------------
 
-    print(f"🚀 Filtered samples: {len(flat_data)}")
-    return flat_data
-
-
-# =========================================================
-# 🔷 RESUME SUPPORT
-# =========================================================
-def load_processed_keys(file_path):
-    processed = set()
-
-    if not os.path.exists(file_path):
-        return processed
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        for line in f:
             try:
                 obj = json.loads(line)
-                key = (
-                    obj["root_id"],
-                    obj["language"],
-                    obj["meta"]["model"]
+
+            except json.JSONDecodeError as e:
+
+                invalid_json += 1
+
+                print(
+                    f"[WARN] Invalid JSON at "
+                    f"line {line_num}: {e}"
                 )
-                processed.add(key)
-            except:
+
                 continue
 
-    print(f"🔁 Loaded processed: {len(processed)}")
+
+            # ---------------------------------------------
+            # Required field check
+            # ---------------------------------------------
+
+            missing = [
+                field
+                for field in required_fields
+                if obj.get(field) is None
+            ]
+
+            if missing:
+
+                missing_fields += 1
+
+                print(
+                    f"[WARN] Line {line_num}: "
+                    f"missing {missing}"
+                )
+
+                continue
+
+
+            root_id = str(
+                obj["root_id"]
+            ).strip()
+
+            language = str(
+                obj["language"]
+            ).strip()
+
+            category = str(
+                obj["category"]
+            ).strip()
+
+            prompt = str(
+                obj["prompt_translated"]
+            ).strip()
+
+
+            if not prompt:
+
+                print(
+                    f"[WARN] Empty prompt at "
+                    f"line {line_num}"
+                )
+
+                continue
+
+
+            # ---------------------------------------------
+            # Dataset identity
+            # ---------------------------------------------
+
+            triple = (
+                root_id,
+                language,
+                category,
+            )
+
+
+            if triple in seen_triples:
+
+                duplicate_triples += 1
+
+                print(
+                    "[WARN] Duplicate triple skipped: "
+                    f"{triple}"
+                )
+
+                continue
+
+
+            seen_triples.add(
+                triple
+            )
+
+
+            records.append({
+
+                "root_id":
+                    root_id,
+
+                "language":
+                    language,
+
+                "category":
+                    category,
+
+                "prompt":
+                    prompt,
+
+                "eval": {
+
+                    "category":
+                        category,
+
+                    "tier":
+                        obj.get(
+                            "tier"
+                        ),
+
+                    "label":
+                        obj.get(
+                            "label"
+                        ),
+
+                    "f1":
+                        clean_json_value(
+                            obj.get("f1")
+                        ),
+
+                    "comet":
+                        clean_json_value(
+                            obj.get("comet")
+                        ),
+
+                    "combined_score":
+                        clean_json_value(
+                            obj.get(
+                                "combined_score"
+                            )
+                        ),
+
+                    "quality_bucket":
+                        obj.get(
+                            "quality_bucket"
+                        ),
+                },
+            })
+
+
+    print("\n========================================")
+    print("INPUT SUMMARY")
+    print("========================================")
+
+    print(
+        f"Valid records       : "
+        f"{len(records):,}"
+    )
+
+    print(
+        f"Duplicate triples   : "
+        f"{duplicate_triples:,}"
+    )
+
+    print(
+        f"Missing fields      : "
+        f"{missing_fields:,}"
+    )
+
+    print(
+        f"Invalid JSON rows   : "
+        f"{invalid_json:,}"
+    )
+
+
+    return records
+
+
+# =========================================================
+# RESUME SUPPORT
+# =========================================================
+
+def load_processed_keys(
+    output_file: Path,
+) -> set:
+    """
+    Load previously completed samples.
+
+    Unique generation identity:
+
+        (
+            root_id,
+            language,
+            category,
+            model
+        )
+    """
+
+    processed = set()
+
+
+    if not output_file.exists():
+        return processed
+
+
+    with output_file.open(
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if not line:
+                continue
+
+            try:
+
+                obj = json.loads(line)
+
+                root_id = obj.get(
+                    "root_id"
+                )
+
+                language = obj.get(
+                    "language"
+                )
+
+                category = obj.get(
+                    "category"
+                )
+
+                if category is None:
+
+                    category = (
+                        obj.get(
+                            "eval",
+                            {}
+                        ).get(
+                            "category"
+                        )
+                    )
+
+                model = (
+                    obj.get(
+                        "meta",
+                        {}
+                    ).get(
+                        "model"
+                    )
+                )
+
+
+                if all([
+                    root_id,
+                    language,
+                    category,
+                    model,
+                ]):
+
+                    processed.add(
+                        (
+                            str(root_id),
+                            str(language),
+                            str(category),
+                            str(model),
+                        )
+                    )
+
+            except Exception:
+                continue
+
+
+    print(
+        f"Resume loaded       : "
+        f"{len(processed):,} existing responses"
+    )
+
+
     return processed
 
 
 # =========================================================
-# 🔷 SAVE JSONL
+# MINDROUTER API
 # =========================================================
-def append_to_jsonl(file_path, records):
-    with open(file_path, "a", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+def call_mindrouter_api(
+    client: OpenAI,
+    prompt: str,
+    model_name: str,
+    system_instruction: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    seed: int,
+) -> Dict[str, Any]:
+    """
+    Call MindRouter's OpenAI-compatible endpoint.
+    """
+
+    start = time.time()
+
+
+    try:
+
+        response = (
+            client.chat.completions.create(
+
+                model=
+                    model_name,
+
+                messages=[
+                    {
+                        "role": "system",
+                        "content":
+                            system_instruction,
+                    },
+                    {
+                        "role": "user",
+                        "content":
+                            prompt,
+                    },
+                ],
+
+                temperature=
+                    temperature,
+
+                top_p=
+                    top_p,
+
+                max_tokens=
+                    max_tokens,
+
+                seed=
+                    seed,
+            )
+        )
+
+
+        latency = (
+            time.time()
+            - start
+        )
+
+
+        choice = (
+            response.choices[0]
+        )
+
+
+        # ---------------------------------------------
+        # Normal response
+        # ---------------------------------------------
+
+        content = (
+            choice.message.content
+        )
+
+
+        # ---------------------------------------------
+        # Some reasoning models may place their output
+        # under reasoning_content instead.
+        # ---------------------------------------------
+
+        if content is None:
+
+            content = getattr(
+                choice.message,
+                "reasoning_content",
+                None,
+            )
+
+
+        if content is None:
+            content = ""
+
+
+        # ---------------------------------------------
+        # Token usage
+        # ---------------------------------------------
+
+        usage = getattr(
+            response,
+            "usage",
+            None,
+        )
+
+
+        prompt_tokens = (
+            getattr(
+                usage,
+                "prompt_tokens",
+                None,
+            )
+            if usage
+            else None
+        )
+
+
+        completion_tokens = (
+            getattr(
+                usage,
+                "completion_tokens",
+                None,
+            )
+            if usage
+            else None
+        )
+
+
+        total_tokens = (
+            getattr(
+                usage,
+                "total_tokens",
+                None,
+            )
+            if usage
+            else None
+        )
+
+
+        return {
+
+            "response":
+                content,
+
+            "error":
+                None,
+
+            "provider_response_id":
+                getattr(
+                    response,
+                    "id",
+                    None,
+                ),
+
+            "prompt_length_tokens":
+                prompt_tokens,
+
+            "response_length_tokens":
+                completion_tokens,
+
+            "total_tokens":
+                total_tokens,
+
+            "finish_reason":
+                getattr(
+                    choice,
+                    "finish_reason",
+                    None,
+                ),
+
+            "time_per_sample_sec":
+                latency,
+        }
+
+
+    except Exception as e:
+
+        latency = (
+            time.time()
+            - start
+        )
+
+
+        return {
+
+            "response":
+                "ERROR",
+
+            "error":
+                str(e),
+
+            "provider_response_id":
+                None,
+
+            "prompt_length_tokens":
+                None,
+
+            "response_length_tokens":
+                None,
+
+            "total_tokens":
+                None,
+
+            "finish_reason":
+                None,
+
+            "time_per_sample_sec":
+                latency,
+        }
 
 
 # =========================================================
-# 🔷 GENERATOR (API BASED)
+# RESPONSE GENERATION
 # =========================================================
-class UnifiedResponseGenerator:
-    def __init__(self, model_name, max_new_tokens=512, temperature=0, top_p=1, seed=42, api_key="YOUR_API_KEY"):
-        self.model_name = model_name
-        self.max_new_tokens = max_new_tokens
-        self.temperature = temperature
-        self.top_p = top_p
-        self.seed = seed
-        self.api_key = api_key
 
-        print(f"🚀 Using API model: {model_name}")
-
-    def generate_batch(self, prompts, languages):
-        responses = []
-        metadata = []
-
-        batch_start = time.time()
-
-        for i, prompt in enumerate(prompts):
-            start = time.time()
-
-            result = mind_router({
-                "prompt": prompt,
-                "model": self.model_name,
-                "temperature": self.temperature,
-                "top_p": self.top_p,
-                "max_tokens": self.max_new_tokens,
-                "api_key": self.api_key
-            })
-
-            response_text = result["response"]
-
-            end = time.time()
-
-            meta = {
-                # ── Model config ──────────────────────────────────
-                "model":          self.model_name,
-                "temperature":    self.temperature,
-                "top_p":          self.top_p,
-                "max_new_tokens": self.max_new_tokens,
-                "seed": self.seed,
-                
-                # ── Language ──────────────────────────────────────
-                "language":       languages[i],
-                
-                # ── Token counts (from API usage object) ──────────
-                "prompt_length_tokens":   result["prompt_length_tokens"],
-                "response_length_tokens": result["response_length_tokens"],
-                "total_tokens":           result["total_tokens"],
-                
-                # ── Character counts ──────────────────────────────
-                "prompt_length_chars":   len(prompt),
-                "response_length_chars": len(response_text) if response_text != "ERROR" else 0,
-                # ── Timing ────────────────────────────────────────
-                "time_per_sample_sec": end - start,
-                "was_truncated": 0
-            }
-
-            if result["error"]:
-                meta["error"] = result["error"]
-
-            responses.append(response_text)
-            metadata.append(meta)
-
-        total_time = time.time() - batch_start
-
-        for m in metadata:
-            m["batch_samples_per_sec"] = len(prompts) / total_time
-
-        return responses, metadata
+def generate_responses(
+    input_file: Path,
+    output_file: Path,
+    model_name: str,
+    model_family: str,
+    api_key: str,
+    base_url: str,
+    system_instruction: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    seed: int,
+    save_every: int,
+) -> None:
 
 
-# =========================================================
-# 🔷 PIPELINE
-# =========================================================
-def generate_and_save(generator, flat_data, output_file, filter_meta):
-    processed = load_processed_keys(output_file)
+    # -----------------------------------------------------
+    # Load filtered benchmark
+    # -----------------------------------------------------
+
+    data = load_filtered_data(
+        input_file
+    )
+
+
+    # -----------------------------------------------------
+    # Resume
+    # -----------------------------------------------------
+
+    processed = load_processed_keys(
+        output_file
+    )
+
+
+    # -----------------------------------------------------
+    # Select remaining samples
+    # -----------------------------------------------------
+
+    pending = []
+
+
+    for item in data:
+
+        key = (
+            item["root_id"],
+            item["language"],
+            item["category"],
+            model_name,
+        )
+
+
+        if key not in processed:
+
+            pending.append(
+                item
+            )
+
+
+    print("\n========================================")
+    print("GENERATION PLAN")
+    print("========================================")
+
+    print(
+        f"Input file          : "
+        f"{input_file}"
+    )
+
+    print(
+        f"Output file         : "
+        f"{output_file}"
+    )
+
+    print(
+        f"Model               : "
+        f"{model_name}"
+    )
+
+    print(
+        f"Model family        : "
+        f"{model_family}"
+    )
+
+    print(
+        f"Base URL            : "
+        f"{base_url}"
+    )
+
+    print(
+        f"Total dataset       : "
+        f"{len(data):,}"
+    )
+
+    print(
+        f"Already processed   : "
+        f"{len(data) - len(pending):,}"
+    )
+
+    print(
+        f"Remaining           : "
+        f"{len(pending):,}"
+    )
+
+
+    if not pending:
+
+        print(
+            "\nAll samples already processed."
+        )
+
+        return
+
+
+    # -----------------------------------------------------
+    # Create API client once.
+    # -----------------------------------------------------
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+    )
+
+
+    output_file.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+
     buffer = []
 
-    for i in range(0, len(flat_data), 32):
-        batch = flat_data[i:i+32]
+    run_start = time.time()
 
-        prompts = [x["prompt"] for x in batch]
-        langs = [x["language"] for x in batch]
 
-        responses, metas = generator.generate_batch(prompts, langs)
+    # =====================================================
+    # GENERATE
+    # =====================================================
 
-        for j, item in enumerate(batch):
-            key = (item["root_id"], item["language"], generator.model_name)
+    for idx, item in enumerate(
+        pending,
+        start=1,
+    ):
 
-            if key in processed:
-                continue
 
-            record = {
-                "root_id": item["root_id"],
-                "language": item["language"],
-                "prompt": item["prompt"],
-                "response": responses[j],
-                "meta": metas[j],
-                "eval": filter_meta.get((item["root_id"], item["language"]), {})
-            }
+        result = call_mindrouter_api(
 
-            buffer.append(record)
+            client=
+                client,
 
-        if len(buffer) >= 100:
-            append_to_jsonl(output_file, buffer)
-            print(f"💾 Saved {len(buffer)}")
+            prompt=
+                item["prompt"],
+
+            model_name=
+                model_name,
+
+            system_instruction=
+                system_instruction,
+
+            temperature=
+                temperature,
+
+            top_p=
+                top_p,
+
+            max_tokens=
+                max_tokens,
+
+            seed=
+                seed,
+        )
+
+
+        response_text = (
+            result["response"]
+        )
+
+
+        record = {
+
+            # =================================================
+            # Dataset identity
+            # =================================================
+
+            "root_id":
+                item["root_id"],
+
+            "language":
+                item["language"],
+
+            "category":
+                item["category"],
+
+
+            # =================================================
+            # Prompt / response
+            # =================================================
+
+            "prompt":
+                item["prompt"],
+
+            "response":
+                response_text,
+
+
+            # =================================================
+            # Model metadata
+            # =================================================
+
+            "meta": {
+
+                "model":
+                    model_name,
+
+                "model_family":
+                    model_family,
+
+                "base_url":
+                    base_url,
+
+                "temperature":
+                    temperature,
+
+                "top_p":
+                    top_p,
+
+                "max_new_tokens":
+                    max_tokens,
+
+                "seed":
+                    seed,
+
+                "language":
+                    item["language"],
+
+                "prompt_length_tokens":
+                    result[
+                        "prompt_length_tokens"
+                    ],
+
+                "response_length_tokens":
+                    result[
+                        "response_length_tokens"
+                    ],
+
+                "total_tokens":
+                    result[
+                        "total_tokens"
+                    ],
+
+                "prompt_length_chars":
+                    len(
+                        item["prompt"]
+                    ),
+
+                "response_length_chars":
+                    (
+                        len(response_text)
+                        if response_text
+                        and response_text != "ERROR"
+                        else 0
+                    ),
+
+                "time_per_sample_sec":
+                    result[
+                        "time_per_sample_sec"
+                    ],
+
+                "provider_response_id":
+                    result[
+                        "provider_response_id"
+                    ],
+
+                "finish_reason":
+                    result[
+                        "finish_reason"
+                    ],
+
+                "error":
+                    result[
+                        "error"
+                    ],
+            },
+
+
+            # =================================================
+            # Benchmark metadata
+            # =================================================
+
+            "eval":
+                item["eval"],
+        }
+
+
+        buffer.append(
+            record
+        )
+
+
+        # -------------------------------------------------
+        # Periodically append results.
+        # -------------------------------------------------
+
+        if len(buffer) >= save_every:
+
+            append_to_jsonl(
+                output_file,
+                buffer,
+            )
+
+
+            print(
+                f"Saved {len(buffer):,} rows "
+                f"[{idx:,}/{len(pending):,}]"
+            )
+
+
             buffer = []
 
+
+    # -----------------------------------------------------
+    # Flush remaining records.
+    # -----------------------------------------------------
+
     if buffer:
-        append_to_jsonl(output_file, buffer)
 
-    print("✅ DONE")
+        append_to_jsonl(
+            output_file,
+            buffer,
+        )
 
 
-# =========================================================
-# 🔷 MAIN
-# =========================================================
-def main(model_name, model_family, data_dir, filter_file, output_base_dir, api_key):
+        print(
+            f"Saved final "
+            f"{len(buffer):,} rows"
+        )
 
-    print(f"\n🚀 Running model: {model_name}")
 
-    model_tag = model_name.split("/")[-1].lower().replace("-", "_")
+    elapsed = (
+        time.time()
+        - run_start
+    )
 
-    filter_map, filter_meta = load_filter_data(filter_file)
 
-    for batch_num in range(12, 59):
-        input_file = f"{data_dir}/batch_{batch_num}.json"
+    print("\n========================================")
+    print("GENERATION COMPLETE")
+    print("========================================")
 
-        if not os.path.exists(input_file):
-            continue
+    print(
+        f"Generated this run  : "
+        f"{len(pending):,}"
+    )
 
-        print(f"\n📦 Processing batch {batch_num}")
+    print(
+        f"Elapsed seconds     : "
+        f"{elapsed:.2f}"
+    )
 
-        with open(input_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        flat_data = flatten_prompts_filtered(data, filter_map)
-
-        out_dir = f"{output_base_dir}/{model_family}/{model_tag}"
-        os.makedirs(out_dir, exist_ok=True)
-
-        output_file = f"{out_dir}/{model_tag}_{batch_num}.jsonl"
-
-        generator = UnifiedResponseGenerator(model_name, api_key=api_key)
-
-        generate_and_save(generator, flat_data, output_file, filter_meta)
-
-    print("\n✅ ALL BATCHES COMPLETED")
+    print(
+        f"Output file         : "
+        f"{output_file}"
+    )
 
 
 # =========================================================
-# 🔷 CLI
+# CLI
 # =========================================================
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
 
-    parser.add_argument("--model-name", type=str, required=True)
-    parser.add_argument("--model-family", type=str, required=True)
-    parser.add_argument("--data-dir", type=str, required=True)
-    parser.add_argument("--filter-file", type=str, required=True)
-    parser.add_argument("--output-base-dir", type=str, required=True)
-    parser.add_argument("--api-key", type=str, required=True)
+def main() -> None:
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate responses through MindRouter "
+            "from one filtered multilingual AEGIS JSONL."
+        )
+    )
+
+
+    parser.add_argument(
+        "--input-file",
+        required=True,
+        type=Path,
+        help=(
+            "Filtered multilingual AEGIS JSONL"
+        ),
+    )
+
+
+    parser.add_argument(
+        "--output-file",
+        required=True,
+        type=Path,
+        help=(
+            "JSONL file to append responses to"
+        ),
+    )
+
+
+    parser.add_argument(
+        "--model-name",
+        required=True,
+        type=str,
+        help=(
+            "MindRouter model name"
+        ),
+    )
+
+
+    parser.add_argument(
+        "--model-family",
+        required=True,
+        type=str,
+        help=(
+            "Model family name"
+        ),
+    )
+
+
+    parser.add_argument(
+        "--api-key",
+        required=True,
+        type=str,
+        help=(
+            "MindRouter API key"
+        ),
+    )
+
+
+    parser.add_argument(
+        "--base-url",
+        required=True,
+        type=str,
+        help=(
+            "MindRouter OpenAI-compatible base URL"
+        ),
+    )
+
+
+    parser.add_argument(
+        "--system-instruction",
+        required=True,
+        type=str,
+    )
+
+
+    parser.add_argument(
+        "--temperature",
+        required=True,
+        type=float,
+    )
+
+
+    parser.add_argument(
+        "--top-p",
+        required=True,
+        type=float,
+    )
+
+
+    parser.add_argument(
+        "--max-tokens",
+        required=True,
+        type=int,
+    )
+
+
+    parser.add_argument(
+        "--seed",
+        required=True,
+        type=int,
+    )
+
+
+    parser.add_argument(
+        "--save-every",
+        required=True,
+        type=int,
+        help=(
+            "Append results after this many samples"
+        ),
+    )
+
 
     args = parser.parse_args()
 
-    main(
-        model_name=args.model_name,
-        model_family=args.model_family,
-        data_dir=args.data_dir,
-        filter_file=args.filter_file,
-        output_base_dir=args.output_base_dir,
-        api_key=args.api_key
+
+    if not args.input_file.exists():
+
+        raise FileNotFoundError(
+            f"Input file not found: "
+            f"{args.input_file}"
+        )
+
+
+    if args.save_every <= 0:
+
+        raise ValueError(
+            "--save-every must be > 0"
+        )
+
+
+    generate_responses(
+
+        input_file=
+            args.input_file,
+
+        output_file=
+            args.output_file,
+
+        model_name=
+            args.model_name,
+
+        model_family=
+            args.model_family,
+
+        api_key=
+            args.api_key,
+
+        base_url=
+            args.base_url,
+
+        system_instruction=
+            args.system_instruction,
+
+        temperature=
+            args.temperature,
+
+        top_p=
+            args.top_p,
+
+        max_tokens=
+            args.max_tokens,
+
+        seed=
+            args.seed,
+
+        save_every=
+            args.save_every,
     )
+
+
+if __name__ == "__main__":
+    main()
