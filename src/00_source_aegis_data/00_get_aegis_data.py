@@ -12,14 +12,10 @@ Stages
 03 - Keep valid human prompt annotations
 04 - Normalize prompts and detect safe/unsafe label conflicts
 05 - Collapse label-consistent duplicate prompts
-06 - Build safe and unsafe candidate pools
 
-Final outputs
--------------
+Final output
+------------
 stage05_unique_roots.jsonl
-stage06_unsafe_candidates.jsonl
-stage06_safe_candidates.jsonl
-stage06_unsafe_missing_category.jsonl
 
 Important
 ---------
@@ -962,103 +958,6 @@ def stage05_collapse_roots(
 
 
 # =============================================================================
-# Stage 06
-# =============================================================================
-
-def stage06_build_pools(
-    roots,
-    output_dir: Path,
-):
-
-    print(
-        "\n[Stage 06] Building safe / unsafe candidate pools..."
-    )
-
-    unsafe = []
-    safe = []
-    unsafe_missing_category = []
-
-    for row in roots:
-
-        label = row["prompt_label"]
-
-        if label == "unsafe":
-
-            # Unsafe roots without any AEGIS violated category are
-            # separated instead of being silently mixed into the
-            # benchmark candidate pool.
-            if not row.get(
-                "violated_categories"
-            ):
-                unsafe_missing_category.append(
-                    row
-                )
-                continue
-
-            unsafe.append(
-                row
-            )
-
-        elif label == "safe":
-
-            safe.append(
-                row
-            )
-
-    # Stable output ordering by root_id.
-    unsafe = sorted(
-        unsafe,
-        key=lambda x: x["root_id"],
-    )
-
-    safe = sorted(
-        safe,
-        key=lambda x: x["root_id"],
-    )
-
-    unsafe_missing_category = sorted(
-        unsafe_missing_category,
-        key=lambda x: x["root_id"],
-    )
-
-    write_jsonl(
-        output_dir /
-        "stage06_unsafe_candidates.jsonl",
-        unsafe,
-    )
-
-    write_jsonl(
-        output_dir /
-        "stage06_safe_candidates.jsonl",
-        safe,
-    )
-
-    write_jsonl(
-        output_dir /
-        "stage06_unsafe_missing_category.jsonl",
-        unsafe_missing_category,
-    )
-
-    stats = {
-        "input_unique_roots":
-            len(roots),
-
-        "unsafe_candidates":
-            len(unsafe),
-
-        "safe_candidates":
-            len(safe),
-
-        "unsafe_missing_category":
-            len(unsafe_missing_category),
-    }
-
-    print(stats)
-
-    return unsafe, safe, stats
-
-
-# =============================================================================
 # Main
 # =============================================================================
 
@@ -1067,7 +966,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Build canonical AEGIS unique roots "
-            "through Stage 06."
+            "through Stage 05."
         )
     )
 
@@ -1075,7 +974,7 @@ def main():
         "--output-dir",
         required=True,
         help=(
-            "Directory for Stage 00-06 outputs."
+            "Directory for Stage 00-05 outputs."
         ),
     )
 
@@ -1163,20 +1062,8 @@ def main():
         "stage05"
     ] = stats
 
-    # Stage 06
-    unsafe, safe, stats = (
-        stage06_build_pools(
-            roots,
-            output_dir,
-        )
-    )
-
-    all_stats[
-        "stage06"
-    ] = stats
-
     # -------------------------------------------------------------------------
-    # Save Stage 00-06 audit.
+    # Save Stage 00-05 audit.
     # -------------------------------------------------------------------------
 
     audit_file = (
@@ -1192,7 +1079,7 @@ def main():
     print()
     print("=" * 76)
     print(
-        "AEGIS ROOT CONSTRUCTION + STAGE 06 COMPLETE"
+        "AEGIS ROOT CONSTRUCTION COMPLETE"
     )
     print("=" * 76)
 
@@ -1206,30 +1093,10 @@ def main():
         f"{output_dir / 'stage05_unique_roots.jsonl'}"
     )
 
-    print(
-        f"Stage 06 unsafe candidates: "
-        f"{output_dir / 'stage06_unsafe_candidates.jsonl'}"
-    )
 
-    print(
-        f"Stage 06 safe candidates: "
-        f"{output_dir / 'stage06_safe_candidates.jsonl'}"
-    )
 
-    print(
-        f"Stage 06 unsafe missing category: "
-        f"{output_dir / 'stage06_unsafe_missing_category.jsonl'}"
-    )
 
-    print(
-        f"Unsafe candidates: "
-        f"{len(unsafe):,}"
-    )
 
-    print(
-        f"Safe candidates: "
-        f"{len(safe):,}"
-    )
 
     print(
         f"Audit: "
